@@ -20,6 +20,7 @@ import (
 //Config represents a client configuration
 type Config struct {
 	shared           *chshare.Config
+	backupServers    []string
 	Fingerprint      string
 	Auth             string
 	KeepAlive        time.Duration
@@ -46,27 +47,23 @@ type Client struct {
 
 //NewClient creates a new client instance
 func NewClient(config *Config) (*Client, error) {
-	//apply default scheme
-	if !strings.HasPrefix(config.Server, "http") {
-		config.Server = "http://" + config.Server
+	var err error
+	srvs := strings.Split(config.Server, ",")
+	for i, srv := range srvs {
+		srvs[i], err = prepareServerURI(srv)
+		if err != nil {
+			return nil, err
+		}
 	}
+	config.Server = srvs[0]
+	if len(srvs) > 1 {
+		config.backupServers = srvs[1:]
+	}
+
 	if config.MaxRetryInterval < time.Second {
 		config.MaxRetryInterval = 5 * time.Minute
 	}
-	u, err := url.Parse(config.Server)
-	if err != nil {
-		return nil, err
-	}
-	//apply default port
-	if !regexp.MustCompile(`:\d+$`).MatchString(u.Host) {
-		if u.Scheme == "https" || u.Scheme == "wss" {
-			u.Host = u.Host + ":443"
-		} else {
-			u.Host = u.Host + ":80"
-		}
-	}
-	//swap to websockets scheme
-	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
+
 	shared := &chshare.Config{}
 	for _, s := range config.Remotes {
 		r, err := chshare.DecodeRemote(s)
@@ -79,7 +76,7 @@ func NewClient(config *Config) (*Client, error) {
 	client := &Client{
 		Logger:   chshare.NewLogger("client"),
 		config:   config,
-		server:   u.String(),
+		server:   config.Server,
 		running:  true,
 		runningc: make(chan error, 1),
 	}
@@ -103,6 +100,28 @@ func NewClient(config *Config) (*Client, error) {
 	}
 
 	return client, nil
+}
+
+func prepareServerURI(uri string) (string, error) {
+	//apply default scheme
+	if !strings.HasPrefix(uri, "http") {
+		uri = "http://" + uri
+	}
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", err
+	}
+	//apply default port
+	if !regexp.MustCompile(`:\d+$`).MatchString(u.Host) {
+		if u.Scheme == "https" || u.Scheme == "wss" {
+			u.Host = u.Host + ":443"
+		} else {
+			u.Host = u.Host + ":80"
+		}
+	}
+	//swap to websockets scheme
+	u.Scheme = strings.Replace(u.Scheme, "http", "ws", 1)
+	return u.String(), err
 }
 
 //Run starts client and blocks while connected
@@ -181,7 +200,13 @@ func (c *Client) connectionLoop() {
 			c.Debugf(msg)
 			//give up?
 			if maxAttempt >= 0 && attempt >= maxAttempt {
-				break
+				backups := c.config.backupServers
+				if backups == nil || len(backups) == 0 {
+					break
+				}
+				c.server, c.config.backupServers = backups[0], backups[1:]
+				attempt = 0
+				b.Reset()
 			}
 			c.Infof("Retrying in %s...", d)
 			connerr = nil
